@@ -1,0 +1,6 @@
+name = Spot The Dot
+description = A simple customization to perform regression testing
+core = 7.x
+package = Others
+version = 7.x-1.0
+;configure = admin/config/content/og_tag_importer

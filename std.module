@@ -1,0 +1,295 @@
+<?php
+/**
+ * @file
+ * Code for the OG Importer module
+ */
+
+/**
+ * Implements hook_cron
+ */
+function std_cron() {
+  // need a way to clean up the web pages that are no longer in the sets
+  // maybe make it a cron runner
+}
+
+/**
+ * Adding our custom js for diff on the main view
+ * @param $vars
+ */
+function std_preprocess_views_view(&$vars) {
+  if ($vars['view']->name === 'regression_test') {
+    $path = drupal_get_path('module', 'std');
+    drupal_add_js($path . '/std.js');
+    drupal_add_js($path . '/resemble.js');
+  }
+}
+
+/**
+ * Implements hook_form_FORMID_alter
+ */
+function std_form_taxonomy_form_term_alter(&$form, &$form_state, $form_id) {
+  if (isset($form['tid']['#value'])) {
+    // adding button for capture screenshots
+    $form['screenshot'] = array(
+      '#type' => 'fieldset',
+      '#title' => t('Screenshots'),
+      '#weight' => 50,
+      '#collapsible' => FALSE,
+    );
+
+    $form['screenshot']['capture_before'] = array(
+      '#type' => 'submit',
+      '#value' => t('Capture Before'),
+    );
+
+    $form['screenshot']['capture_after'] = array(
+      '#type' => 'submit',
+      '#value' => t('Capture After'),
+    );
+  }
+  $form['#validate'][] = 'std_set_url_validate';
+  $form['#submit'][] = 'std_set_submit';
+}
+
+/**
+ * Our own custom validation handler to check the entered URL
+ * @param $form
+ * @param $form_state
+ */
+function std_set_url_validate($form, &$form_state) {
+  // @todo: add drupal_request later to make sure we don't have a number of 403 and 404
+  $_urls = $form_state['values']['field_set_urls'][LANGUAGE_NONE][0]['value'];
+  $_urls = nl2br($_urls);
+  $urls = explode('<br />', $_urls);
+  foreach ($urls as $key => $url) {
+    $url = trim($url);
+    $urls[$key] = $url;
+    if (!valid_url($url, TRUE)) {
+      form_set_error('field_set_urls', $url . ' is not a valid url');
+    }
+  }
+  // hold these in the variables
+  variable_set('std_set', $urls);
+  $form_state['set'] = $urls;
+}
+
+/**
+ * Submission handler for the set, this will trigger a batch to sync the set contents
+ * @param $form
+ * @param $form_state
+ */
+function std_set_submit($form, &$form_state) {
+  if ($form_state['input']['op'] == 'Capture Before') {
+    $op = 'before';
+    $nids = _std_nodes_in_set($form_state['values']['tid']);
+
+  }
+  elseif ($form_state['input']['op'] == 'Capture After') {
+    $op = 'after';
+    $nids = _std_nodes_in_set($form_state['values']['tid']);
+
+  } else {
+    $op = 'sync';
+    // these are just URLs in this case, not nids
+    $nids = $form_state['set'];
+  }
+
+  if (empty($nids)) {
+    drupal_set_message('No test pages to sync or capture screenshots for.');
+    return;
+  }
+  $function = 'std_set_batch';
+  $batch = $function($op, $form_state['values']['tid'], $nids);
+  batch_set($batch);
+}
+
+/**
+ * Batch operation function
+ * @param $op     The type of operation we are batching: SYNC | BEFORE | AFTER
+ * @param $tid    The term id of for the current set
+ * @param $nids   The Either the list of nids or urls (in case of syncing)
+ * @return array
+ */
+function std_set_batch($op, $tid, $nids) {
+  // 1. If are syncing
+  switch ($op) {
+    case 'before':
+      $function = 'std_batch_before_operation';
+    break;
+    case 'after':
+      $function = 'std_batch_after_operation';
+    break;
+    case 'sync':
+    default:
+    $function = 'std_batch_sync_operation';
+    break;
+  }
+
+  $num_operations = count($nids);
+  drupal_set_message(t('Syncing @num test set web pages', array('@num' => $num_operations)));
+  $operations = array();
+  for ($i = 0; $i < $num_operations; $i++) {
+    $operations[] = array(
+      $function,
+      array(
+        $nids[$i],
+        $tid,
+        t('(Operation @operation)', array('@operation' => $i)),
+      ),
+    );
+  }
+  $batch = array(
+    'operations' => $operations,
+    'finished' => 'std_batch_finished',
+  );
+  return $batch;
+}
+
+/**
+ * Batch worker callback for capturing before picture
+ * @param $nid
+ * @param $tid
+ * @param $operation_details
+ * @param $context
+ */
+function std_batch_before_operation($nid, $tid, $operation_details, &$context) {
+  _std_batch_screen_capture($nid);
+  $context['message'] = t('Capturing before screenshots for @url', array('@url' => $node->title)) . ' ' . $operation_details;
+}
+
+/**
+ * Batch worker callback for capturing after picture
+ * @param $nid
+ * @param $tid
+ * @param $operation_details
+ * @param $context
+ */
+function std_batch_after_operation($nid, $tid, $operation_details, &$context) {
+  _std_batch_screen_capture($nid, 'after');
+  $context['message'] = t('Capturing after screenshots for @nid', array('@nid' => $nid)) . ' ' . $operation_details;
+}
+
+/**
+ * Perform screen capturing
+ * @param $nid
+ * @param string $type
+ */
+function _std_batch_screen_capture($nid, $type = 'before') {
+  $dir = 'public://' . $type;
+  if (!file_prepare_directory($dir)) {
+    drupal_mkdir($dir);
+  }
+  $node = node_load($nid);
+  // Do the screenshot capture
+  // @todo: how do we enforce the phantomjs requirement
+  $path = drupal_get_path('module', 'std') . '/screen.js';
+  shell_exec('phantomjs ' . $path . ' ' . $node->title . ' sites/default/files/' . $type . '/' . $nid . '.png');
+
+  // saving successfully saved files into the file_managed table
+  if (!file_exists('sites/default/files/' . $type . '/' . $nid . '.png')) {
+    return;
+  }
+
+  // otherwise we will get error when re-generating the screenshots
+  // if the screenshot has already been updated by phantom, there is no need to do anything to the files table
+  $files = file_load_multiple(array(), array('uri' => 'public://' . $type . '/' . $nid . '.png'));
+  $file = reset($files);
+  if (!empty($file)) {
+    // perhaps update it? (update filesize and date)
+    $file->timestamp = REQUEST_TIME;
+    $file->filesize = sizeof('sites/default/files/' . $type . '/' . $nid . '.png');
+    file_save($file);
+    return;
+  }
+  $save = new stdClass();
+  $save->uid = 1;
+  $save->uri = 'public://' . $type . '/' . $nid . '.png';
+  $save->filename = $nid . '.png';
+  $save->filemime = 'image/png';
+  $save->status = 1;
+  $saved = file_save($save);
+
+  // put new saved file into the node
+  $field = 'field_image_' . $type;
+  $node->{$field}[LANGUAGE_NONE][0]['fid'] = $saved->fid;
+  node_save($node);
+}
+
+
+/**
+ * Batch worker callback for syncing
+ * @param $url
+ * @param $tid
+ * @param $operation_details
+ * @param $context
+ */
+function std_batch_sync_operation($url, $tid, $operation_details, &$context) {
+  global $user;
+
+  // 1. Check to see if any web page CT has been created with the url as its title (In the current SET tagged as taxonomy)
+  $query = new EntityFieldQuery();
+  $query->entityCondition('entity_type', 'node')
+    ->entityCondition('bundle', 'web_page')
+    ->propertyCondition('status', 1)
+    ->propertyCondition('title', $url)
+    ->fieldCondition('field_set_ref', 'tid', $tid);
+  $result = $query->execute();
+
+  // 2a. If yes let's skip it
+  // 2b. If No let's programmatically create the node
+  if (empty($result)) {
+    $node = new stdClass();
+    $node->title = $url;
+    $node->type = "web_page";
+    node_object_prepare($node);
+    $node->language = LANGUAGE_NONE;
+    $node->uid = $user->uid;
+    $node->status = 1;
+    $node->promote = 0;
+    $node->comment = 0;
+    $node->field_set_ref[LANGUAGE_NONE][]['tid'] = $tid;
+    node_save($node);
+    $context['results'][] = $node->title;
+  }
+  // Optional message displayed under the progressbar.
+  $context['message'] = t('Syncing @url', array('@url' => $url)) . ' ' . $operation_details;
+}
+
+/**
+ * Batch 'finished' callback used by both batch 1 and batch 2.
+ */
+function std_batch_finished($success, $results, $operations) {
+  if ($success) {
+    drupal_set_message(t('Process finished... with @results items performed', array('@results' => count($results))));
+  }
+  else {
+    $error_operation = reset($operations);
+    drupal_set_message(
+      t('An error occurred while processing @operation with arguments : @args',
+        array(
+          '@operation' => $error_operation[0],
+          '@args' => print_r($error_operation[0], TRUE),
+        )
+      )
+    );
+  }
+}
+
+/**
+ * A quick EFQ to find out how many nodes in a SET
+ * @param $tid
+ * @return mixed
+ */
+function _std_nodes_in_set($tid) {
+  $query = new EntityFieldQuery();
+  $query->entityCondition('entity_type', 'node')
+    ->entityCondition('bundle', 'web_page')
+    ->propertyCondition('status', 1)
+    ->fieldCondition('field_set_ref', 'tid', $tid);
+  $result = $query->execute();
+  if (empty($result)) {
+    return array();
+  } else {
+    return array_keys($result['node']);
+  }
+}
