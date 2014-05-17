@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <script src="https://ajax.googleapis.com/ajax/libs/jquery/1.9.1/jquery.min.js"></script>
+    <script src="resemble.js"></script>
+    <script type="text/javascript">
+        $(function(){
+            var before = getParameterByName('before');
+            var after = getParameterByName('after');
+            var nid = getParameterByName('nid');
+
+            if (before == '' || after == '') {
+                console.log('Neither before or after image is missing');
+                return;
+            }
+            if (nid == '') {
+                console.log('No id provided, abort');
+                return;
+            }
+            // Figuring out the base url for the site
+            var current_url = window.location.href;
+            var pos = current_url.indexOf("/sites");
+            var base_url = current_url.substring(0, pos);
+            resemble(before).compareTo(after).onComplete(function(data) {
+                var diffImage = new Image();
+                var image_data = data.getImageDataUrl();
+                var post_data = {
+                    "image_data": image_data,
+                    "nid": nid,
+                    "diff": data.misMatchPercentage
+                };
+                $.post(base_url + '/ajax/resemblejs', post_data, function() {
+                     // callback can later be used to record info
+                });
+            });
+            function getParameterByName(name) {
+                name = name.replace(/[\[]/, "\\[").replace(/[\]]/, "\\]");
+                var regex = new RegExp("[\\?&]" + name + "=([^&#]*)"),
+                        results = regex.exec(location.search);
+                return results == null ? "" : decodeURIComponent(results[1].replace(/\+/g, " "));
+            }
+        });
+    </script>
+    <title></title>
+</head>
+<body></body>
+</html>

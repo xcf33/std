@@ -5,11 +5,51 @@
  */
 
 /**
+ * Implements hook_menu
+ */
+function std_menu() {
+  $items['ajax/resemblejs'] = array(
+    'type' => MENU_CALLBACK,
+    'title' => 'Resemble JS callback',
+    'page callback' => 'std_resemble_ajax',
+    'access callback' => TRUE,
+  );
+
+  return $items;
+}
+
+/**
+ * Ajax callback to create a diff image
+ */
+function std_resemble_ajax() {
+  if (empty($_POST['image_data']) || empty($_POST['nid'])) {
+    return 'No data received';
+  }
+  // security sucks, for now complete lockdown is good, we need htpassword lock down
+  // create a managed file entry
+  // also the post data should contain the node id of the node this goes to, perform some action to save the image there
+  $nid = $_POST['nid'];
+  $node = node_load($nid);
+  $lang = $node->language;
+  $image = substr($_POST['image_data'], 22);
+  $file = file_save_data(base64_decode($image), "public://diff/" . $nid . '.png', FILE_EXISTS_REPLACE);
+  $node->field_image_diff[$lang][0] = array(
+    'fid' => $file->fid,
+  );
+  // Add the diff percentage
+  if (!empty($_POST['diff'])) {
+    $node->field_difference[$lang][0]['value'] = check_plain($_POST['diff']);
+  }
+  node_save($node);
+}
+
+/**
  * Implements hook_cron
  */
 function std_cron() {
   // need a way to clean up the web pages that are no longer in the sets
   // maybe make it a cron runner
+
 }
 
 /**
@@ -19,7 +59,6 @@ function std_cron() {
 function std_preprocess_views_view(&$vars) {
   if ($vars['view']->name === 'regression_test') {
     $path = drupal_get_path('module', 'std');
-    drupal_add_js($path . '/std.js');
     drupal_add_js($path . '/resemble.js');
   }
 }
@@ -46,6 +85,11 @@ function std_form_taxonomy_form_term_alter(&$form, &$form_state, $form_id) {
       '#type' => 'submit',
       '#value' => t('Capture After'),
     );
+
+    $form['screenshot']['generate_diff'] = array(
+      '#type' => 'submit',
+      '#value' => t('Generate Diff'),
+    );
   }
   $form['#validate'][] = 'std_set_url_validate';
   $form['#submit'][] = 'std_set_submit';
@@ -57,6 +101,10 @@ function std_form_taxonomy_form_term_alter(&$form, &$form_state, $form_id) {
  * @param $form_state
  */
 function std_set_url_validate($form, &$form_state) {
+  if ($form_state['input']['op'] == 'Delete') {
+    return;
+  }
+
   // @todo: add drupal_request later to make sure we don't have a number of 403 and 404
   $_urls = $form_state['values']['field_set_urls'][LANGUAGE_NONE][0]['value'];
   $_urls = nl2br($_urls);
@@ -79,21 +127,29 @@ function std_set_url_validate($form, &$form_state) {
  * @param $form_state
  */
 function std_set_submit($form, &$form_state) {
-  if ($form_state['input']['op'] == 'Capture Before') {
-    $op = 'before';
-    $nids = _std_nodes_in_set($form_state['values']['tid']);
-
-  }
-  elseif ($form_state['input']['op'] == 'Capture After') {
-    $op = 'after';
-    $nids = _std_nodes_in_set($form_state['values']['tid']);
-
-  } else {
-    $op = 'sync';
-    // these are just URLs in this case, not nids
-    $nids = $form_state['set'];
+  if ($form_state['input']['op'] == 'Delete') {
+    return;
   }
 
+  switch($form_state['input']['op']) {
+    case 'Capture Before':
+      $op = 'before';
+      $nids = _std_nodes_in_set($form_state['values']['tid']);
+    break;
+    case 'Capture After':
+      $op = 'after';
+      $nids = _std_nodes_in_set($form_state['values']['tid']);
+    break;
+    case 'Generate Diff':
+      $op = 'diff';
+      $nids = _std_nodes_in_set($form_state['values']['tid']);
+    break;
+    default:
+      $op = 'sync';
+      // These are just URLs in this case, not nids
+      $nids = $form_state['set'];
+    break;
+  }
   if (empty($nids)) {
     drupal_set_message('No test pages to sync or capture screenshots for.');
     return;
@@ -119,14 +175,16 @@ function std_set_batch($op, $tid, $nids) {
     case 'after':
       $function = 'std_batch_after_operation';
     break;
+    case 'diff':
+      $function = 'std_batch_diff_operation';
+    break;
     case 'sync':
     default:
     $function = 'std_batch_sync_operation';
     break;
   }
-
   $num_operations = count($nids);
-  drupal_set_message(t('Syncing @num test set web pages', array('@num' => $num_operations)));
+  drupal_set_message(ucwords($op) . t('ing @num test set web pages', array('@num' => $num_operations)));
   $operations = array();
   for ($i = 0; $i < $num_operations; $i++) {
     $operations[] = array(
@@ -154,7 +212,8 @@ function std_set_batch($op, $tid, $nids) {
  */
 function std_batch_before_operation($nid, $tid, $operation_details, &$context) {
   _std_batch_screen_capture($nid);
-  $context['message'] = t('Capturing before screenshots for @url', array('@url' => $node->title)) . ' ' . $operation_details;
+  $context['message'] = t('Capturing before screenshots for @url', array('@url' => $nid)) . ' ' . $operation_details;
+  $context['results'][] = $nid;
 }
 
 /**
@@ -167,7 +226,35 @@ function std_batch_before_operation($nid, $tid, $operation_details, &$context) {
 function std_batch_after_operation($nid, $tid, $operation_details, &$context) {
   _std_batch_screen_capture($nid, 'after');
   $context['message'] = t('Capturing after screenshots for @nid', array('@nid' => $nid)) . ' ' . $operation_details;
+  $context['results'][] = $nid;
 }
+
+/**
+ * Batch worker callback for capturing after picture
+ * @param $nid
+ * @param $tid
+ * @param $operation_details
+ * @param $context
+ */
+function std_batch_diff_operation($nid, $tid, $operation_details, &$context) {
+  // 1. Load the node and see what's up
+  // 2. Make a request to the plain html file for diff comparison
+  // 3. Sync managed file table
+  $node = node_load($nid);
+  if (empty($node->field_image_before) || empty($node->field_image_after)) {
+    return;
+  }
+  global $base_url;
+  $script = drupal_get_path('module', 'std') . '/ajax.js';
+  $request_url = $base_url . '/' . drupal_get_path('module', 'std') . '/compare.html';
+  $lang = $node->language;
+  // We use Phantom js to open this page
+  shell_exec('phantomjs ' . $script . ' ' . $request_url . ' ' . file_create_url($node->field_image_before[$lang][0]['uri']) . ' ' . file_create_url($node->field_image_after[$lang][0]['uri']) . ' ' . $nid);
+
+  // $result = drupal_http_request($request_url . $query);
+  $context['message'] = t('Generating diff for @nid', array('@nid' => $nid)) . ' ' . $operation_details;
+}
+
 
 /**
  * Perform screen capturing
@@ -180,16 +267,15 @@ function _std_batch_screen_capture($nid, $type = 'before') {
     drupal_mkdir($dir);
   }
   $node = node_load($nid);
-  // Do the screenshot capture
+
   // @todo: how do we enforce the phantomjs requirement
+  // Do the screenshot capture
   $path = drupal_get_path('module', 'std') . '/screen.js';
   shell_exec('phantomjs ' . $path . ' ' . $node->title . ' sites/default/files/' . $type . '/' . $nid . '.png');
-
   // saving successfully saved files into the file_managed table
   if (!file_exists('sites/default/files/' . $type . '/' . $nid . '.png')) {
     return;
   }
-
   // otherwise we will get error when re-generating the screenshots
   // if the screenshot has already been updated by phantom, there is no need to do anything to the files table
   $files = file_load_multiple(array(), array('uri' => 'public://' . $type . '/' . $nid . '.png'));
